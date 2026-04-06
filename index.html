@@ -415,9 +415,9 @@ async function setupConnect(){
     D = data;
 
     // Write defaults to gist if empty
-    if(!fileContent || !JSON.parse(fileContent || '{}').chores){
+    if(!fileContent || !(()=>{ try{ return JSON.parse(fileContent).chores; }catch(e){ return false; } })()){
       dbg('Writing defaults to gist…');
-      await pushData();
+      await writeToGist();
     }
 
     checkResets();
@@ -451,17 +451,22 @@ function setSyncStatus(state, msg){
   }
 }
 
+async function writeToGist(){
+  // Direct write — used during init before polling starts
+  const resp = await fetch(gistUrl(cfg.gistId), {
+    method: 'PATCH',
+    headers: authHeaders(cfg.token),
+    body: JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(D) } } })
+  });
+  if(!resp.ok) throw new Error('Gist write failed: HTTP ' + resp.status);
+}
+
 async function pushData(){
   if(saving){ pendingSave=true; return; }
   saving = true;
   setSyncStatus('busy','Saving…');
   try {
-    const resp = await fetch(gistUrl(cfg.gistId), {
-      method: 'PATCH',
-      headers: authHeaders(cfg.token),
-      body: JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(D) } } })
-    });
-    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    await writeToGist();
     setSyncStatus('ok','Synced');
   } catch(e){
     setSyncStatus('err','Save failed');
@@ -479,7 +484,8 @@ async function pullData(){
     const gist = await resp.json();
     const content = gist.files && gist.files[GIST_FILE] && gist.files[GIST_FILE].content;
     if(!content) return;
-    const json = JSON.parse(content);
+    let json;
+    try { json = JSON.parse(content); } catch(e){ return; }
     if(json && json.chores){
       D = json;
       checkResets();
@@ -503,8 +509,15 @@ async function init(){
     if(!resp.ok) throw new Error('HTTP ' + resp.status);
     const gist = await resp.json();
     const content = gist.files && gist.files[GIST_FILE] && gist.files[GIST_FILE].content;
-    const json = content ? JSON.parse(content) : null;
-    D = (json && json.chores) ? json : JSON.parse(JSON.stringify(DEFAULT_DATA));
+    let json = null;
+    try { json = content ? JSON.parse(content) : null; } catch(e){}
+    if(json && json.chores){
+      D = json;
+    } else {
+      // Gist is empty or invalid — write defaults to it now
+      D = JSON.parse(JSON.stringify(DEFAULT_DATA));
+      await writeToGist();
+    }
     checkResets();
     showApp();
     initUser();
