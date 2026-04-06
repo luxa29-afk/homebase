@@ -204,9 +204,9 @@ textarea.form-control { resize: vertical; min-height: 100px; }
     <div class="step-num">3</div>
     <div class="step-body">
       <div class="step-label">Create a Gist</div>
-      <div class="step-desc">Go to gist.github.com → New gist. Filename: <code style="background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:11px">homebase.json</code>, content: <code style="background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:11px">{}</code>. Click "Create secret gist". Copy the Gist ID from the URL (the long hash at the end).</div>
+      <div class="step-desc">Go to gist.github.com → New gist. Filename: <code style="background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:11px">homebase.json</code>, content: <code style="background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:11px">{}</code>. Click "Create secret gist". Then paste the <strong>full URL</strong> from your browser bar below (e.g. https://gist.github.com/yourname/abc123...).</div>
       <a class="step-link" href="https://gist.github.com" target="_blank">Create gist &rarr;</a>
-      <input class="setup-input" id="setup-gistid" placeholder="Paste Gist ID here (e.g. 4b3e2a1f...)" autocomplete="off" style="margin-top:8px" />
+      <input class="setup-input" id="setup-gistid" placeholder="Paste full Gist URL or just the ID (abc123...)" autocomplete="off" style="margin-top:8px" />
     </div>
   </div>
 
@@ -361,7 +361,9 @@ function showSetup(){
 }
 function resetConnection(){
   if(!confirm('Disconnect? You can reconnect with the same token and Gist ID.')) return;
-  localStorage.removeItem(CFG_KEY);
+  try { localStorage.removeItem(CFG_KEY); } catch(e){}
+  history.replaceState(null, '', location.pathname);
+  cfg = {};
   showSetup();
 }
 function showLoading(){
@@ -385,19 +387,26 @@ async function setupConnect(){
   errEl.style.display='none';
 
   if(!token){ errEl.textContent='Please paste your GitHub token.'; errEl.style.display=''; return; }
-  if(!gistId){ errEl.textContent='Please paste your Gist ID.'; errEl.style.display=''; return; }
+  if(!gistId){ errEl.textContent='Please paste your Gist ID or full Gist URL.'; errEl.style.display=''; return; }
+
+  // Accept full URL like https://gist.github.com/user/abc123 or just the ID
+  const gistIdClean = gistId.includes('gist.github.com')
+    ? gistId.split('/').filter(Boolean).pop()
+    : gistId.trim();
 
   btn.textContent='Connecting…'; btn.disabled=true;
-  dbg('Reading gist ' + gistId + '…');
+  dbg('Reading gist ' + gistIdClean + '…');
 
   try {
-    const resp = await fetch(gistUrl(gistId), { headers: authHeaders(token) });
+    const resp = await fetch(gistUrl(gistIdClean), { headers: authHeaders(token) });
     dbg('GET HTTP ' + resp.status);
-    if(resp.status === 401) throw new Error('Token is invalid or expired. Generate a new one on GitHub.');
-    if(resp.status === 404) throw new Error('Gist not found. Check the Gist ID.');
+    if(resp.status === 401) throw new Error('Token is invalid or expired — go to github.com/settings/tokens and generate a new one.');
+    if(resp.status === 404) throw new Error('Gist not found (404). Double-check the Gist ID or paste the full Gist URL.');
+    if(resp.status === 403) throw new Error('Access forbidden (403). Make sure the token has the "gist" scope.');
     if(!resp.ok) throw new Error('GitHub returned HTTP ' + resp.status);
 
     const gist = await resp.json();
+    dbg('Gist owner: ' + (gist.owner && gist.owner.login) + ', files: ' + Object.keys(gist.files || {}).join(', '));
     const fileContent = gist.files && gist.files[GIST_FILE] && gist.files[GIST_FILE].content;
 
     let data;
@@ -410,11 +419,11 @@ async function setupConnect(){
       data = JSON.parse(JSON.stringify(DEFAULT_DATA));
     }
 
-    cfg = { token, gistId };
-    localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
+    // Save credentials to localStorage + URL hash
+    saveCfg(token, gistIdClean);
     D = data;
 
-    // Write defaults to gist if empty
+    // Write defaults to gist if it was empty
     if(!fileContent || !(()=>{ try{ return JSON.parse(fileContent).chores; }catch(e){ return false; } })()){
       dbg('Writing defaults to gist…');
       await writeToGist();
@@ -498,14 +507,38 @@ async function pullData(){
 function startPolling(){ setInterval(()=>{ if(!saving) pullData(); }, 15000); }
 function save(){ clearTimeout(syncTimer); syncTimer = setTimeout(pushData, 600); }
 
-async function init(){
-  const savedCfg = localStorage.getItem(CFG_KEY);
-  if(!savedCfg){ showSetup(); return; }
-  cfg = JSON.parse(savedCfg);
-  if(!cfg.token || !cfg.gistId){ showSetup(); return; }
+function saveCfg(token, gistId){
+  // Save to localStorage AND encode in URL hash as backup
+  cfg = { token, gistId };
+  try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch(e){}
+  // Store as base64 in URL hash so it survives localStorage clears
+  try {
+    const encoded = btoa(JSON.stringify({ token, gistId }));
+    history.replaceState(null, '', '#' + encoded);
+  } catch(e){}
+}
+
+function loadCfg(){
+  // Try localStorage first
+  try {
+    const s = localStorage.getItem(CFG_KEY);
+    if(s){ const p = JSON.parse(s); if(p.token && p.gistId) return p; }
+  } catch(e){}
+  // Fall back to URL hash
+  try {
+    const hash = location.hash.slice(1);
+    if(hash){
+      const p = JSON.parse(atob(hash));
+      if(p.token && p.gistId) return p;
+    }
+  } catch(e){}
+  return null;
+}
+
+async function connectWithCfg(token, gistId){
   showLoading();
   try {
-    const resp = await fetch(gistUrl(cfg.gistId), { headers: authHeaders(cfg.token) });
+    const resp = await fetch(gistUrl(gistId), { headers: authHeaders(token) });
     if(!resp.ok) throw new Error('HTTP ' + resp.status);
     const gist = await resp.json();
     const content = gist.files && gist.files[GIST_FILE] && gist.files[GIST_FILE].content;
@@ -514,7 +547,6 @@ async function init(){
     if(json && json.chores){
       D = json;
     } else {
-      // Gist is empty or invalid — write defaults to it now
       D = JSON.parse(JSON.stringify(DEFAULT_DATA));
       await writeToGist();
     }
@@ -525,9 +557,18 @@ async function init(){
     setSyncStatus('ok','Synced');
     startPolling();
   } catch(e){
-    console.error('[HomeBase] init error:', e);
+    console.error('[HomeBase] connect error:', e);
     showSetup();
   }
+}
+
+async function init(){
+  const savedCfg = loadCfg();
+  if(!savedCfg){ showSetup(); return; }
+  cfg = savedCfg;
+  // Refresh both storage locations
+  saveCfg(cfg.token, cfg.gistId);
+  await connectWithCfg(cfg.token, cfg.gistId);
 }
 
 
